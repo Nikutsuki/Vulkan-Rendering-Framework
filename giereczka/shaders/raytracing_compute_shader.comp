@@ -1,0 +1,159 @@
+#version 450
+#extension GL_ARB_separate_shader_objects: enable
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (set = 0, binding = 0) uniform GlobalUbo {
+    mat4 projection_matrix;
+    mat4 view_matrix;
+    mat4 inverse_view_matrix;
+    vec4 ambient_light_color;
+    // Light data included
+} ubo;
+
+layout (push_constant) uniform Push {
+    mat4 model_matrix;
+    vec3 color;
+    int texture_index;
+} push;
+
+layout (set = 3, binding = 0) uniform sampler2D texSampler[];
+layout (binding = 0, set = 4) uniform writeonly image2D resultImage;
+
+// Ray structure
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+// Sphere primitive for testing
+struct Sphere {
+    vec3 position;
+    float radius;
+    vec3 color;
+    float reflectivity;
+};
+
+// Simple scene with a few spheres for testing
+const Sphere spheres[] = {
+// Ground sphere
+{vec3(0.0, - 1000.0, 0.0), 1000.0, vec3(0.8, 0.8, 0.8), 0.0},
+// Feature spheres
+{vec3(0.0, 1.0, 0.0), 1.0, vec3(0.8, 0.3, 0.3), 0.7},
+{vec3(- 4.0, 1.0, 0.0), 1.0, vec3(0.3, 0.8, 0.3), 0.2},
+{vec3(4.0, 1.0, 0.0), 1.0, vec3(0.3, 0.3, 0.8), 0.5}
+};
+
+const int MAX_DEPTH = 3;
+
+bool intersectSphere(Ray ray, Sphere sphere, out float t, out vec3 normal) {
+vec3 oc = ray.origin - sphere.position;
+float a = dot(ray.direction, ray.direction);
+float b = 2.0 * dot(oc, ray.direction);
+float c = dot(oc, oc) - sphere.radius * sphere.radius;
+float discriminant = b * b - 4.0 * a * c;
+
+if (discriminant < 0.0) {
+return false;
+}
+
+float dist = (- b - sqrt(discriminant)) / (2.0 * a);
+if (dist < 0.001) {
+dist = (- b + sqrt(discriminant)) / (2.0 * a);
+if (dist < 0.001) {
+return false;
+}
+}
+
+t = dist;
+normal = normalize((ray.origin + ray.direction * t) - sphere.position);
+return true;
+}
+
+vec3 traceRay(Ray ray, int depth) {
+// Sky color
+vec3 color = vec3(0.5, 0.7, 1.0);
+vec3 attenuation = vec3(1.0);
+
+for (int bounce = 0; bounce < depth; bounce++) {
+float closest_t = 1e30;
+int hit_sphere_index = - 1;
+vec3 hit_normal;
+
+// Check intersection with all spheres
+for (int i = 0; i < spheres.length(); i++) {
+float t;
+vec3 normal;
+if (intersectSphere(ray, spheres[i], t, normal)) {
+if (t < closest_t) {
+closest_t = t;
+hit_sphere_index = i;
+hit_normal = normal;
+}
+}
+}
+
+// If we hit a sphere
+if (hit_sphere_index >= 0) {
+vec3 hit_point = ray.origin + ray.direction * closest_t;
+vec3 sphere_color = spheres[hit_sphere_index].color;
+
+// Simple lighting
+vec3 light_dir = normalize(vec3(1.0, 1.0, 1.0));
+float diffuse = max(dot(hit_normal, light_dir), 0.0);
+
+// Direct lighting contribution
+color = attenuation * sphere_color * (0.2 + 0.8 * diffuse);
+
+// Update for reflection
+ray.origin = hit_point;
+ray.direction = reflect(ray.direction, hit_normal);
+attenuation *= spheres[hit_sphere_index].reflectivity;
+
+// If negligible contribution, break
+if (length(attenuation) < 0.01) {
+break;
+}
+} else {
+// Hit the sky
+color = attenuation * vec3(0.5, 0.7, 1.0);
+break;
+}
+}
+
+return color;
+}
+
+void main() {
+ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+ivec2 image_size = imageSize(resultImage);
+
+if (pixel_coords.x >= image_size.x || pixel_coords.y >= image_size.y) {
+return;
+}
+
+// Get camera position from view matrix
+vec3 camera_pos = ubo.inverse_view_matrix[3].xyz;
+
+// Create ray for this pixel
+vec2 uv = (vec2(pixel_coords) / vec2(image_size)) * 2.0 - 1.0;
+
+// Apply aspect ratio correction
+float aspect = float(image_size.x) / float(image_size.y);
+uv.x *= aspect;
+
+Ray ray;
+ray.origin = camera_pos;
+ray.direction = normalize(vec3(uv.x, uv.y, -1.0));
+
+// Transform ray direction from camera space to world space
+ray.direction = (ubo.inverse_view_matrix * vec4(ray.direction, 0.0)).xyz;
+
+// Trace the ray
+vec3 color = traceRay(ray, MAX_DEPTH);
+
+// Simple tone mapping
+color = color / (color + 1.0);
+
+// Write to output image
+imageStore(resultImage, pixel_coords, vec4(color, 1.0));
+}
